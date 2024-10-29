@@ -1,0 +1,243 @@
+USE [master]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_BackupInfo]    Script Date: 10/28/2024 8:05:40 PM     Copyrite 2024 Eric Peterson.   For non resale or personal use******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+CREATE OR ALTER   Procedure [dbo].[sp_BackupInfo] 
+(@LegacyDB Varchar(10) = 'No' )
+
+As
+ 
+
+SET NOCOUNT on
+SET ANSI_WARNINGS off
+
+declare	@type		varchar(20)  
+declare	@DBIn		varchar(100) 
+declare	@options	varchar(100) 
+
+
+--*********************************  Update these values that best work for your environment **********************************************************
+--*                                                                                                                                                   *
+	declare	@DBCurrent	int   = -1 -- Backups/DIff less than one day old are given a status of Current                                                *
+	Declare @DBFailure  int   = -7 -- Backups older than 1 week old are given a status of Failure                                                     *
+                              -- Backups between these values are given a status of Warning, to look for differential backups.                        *
+--*                                                                                                                                                   *
+--*****************************************************************************************************************************************************
+
+
+--declare @LegacyDB VARCHAR(10)
+--set @legacyDB = 'No'
+
+-- Get the last full backup from the backupset for all databases including dropped (legacy) databases and databases that have no backups 
+
+--  drop table #BU_FullStart
+
+SELECT  
+		ISNULL(d.name, ( s.database_name + ' (Legacy)' ))	AS 'DBName' ,
+        MAX(s.backup_start_date)							AS 'LastFullBackup' ,
+        ISNULL(d.state_desc, 'Disconnected') AS 'DBState' ,
+		d.recovery_model_desc,
+		create_date,
+		Case 
+			When d.source_database_Id > 0 then 'Yes'
+			Else 'No'     end			as DBSnapshot,
+        CASE 
+             WHEN MAX(s.backup_start_date) IS NULL 
+				THEN 'No Backup!'
+			 WHEN MAX(s.backup_start_date) > DATEADD(DAY, @DBCurrent, GETDATE()) --> backups older than 24 hours
+				THEN 'Current'
+			 WHEN d.state_desc = 'OFFLINE'
+				THEN 'Unknown' 
+			 WHEN  MAX(s.backup_start_date) > DATEADD(DAY, @DBFailure, getdate()) 
+				THEN 'Warning'
+             ELSE 'Failed'
+        END AS 'Status'
+Into #BU_FullStart
+FROM    msdb.dbo.backupset s
+Full OUTER JOIN master.sys.databases d 
+	ON d.name = s.database_name
+Where   ( s.type = 'D'
+          OR s.type IS NULL )
+        AND ISNULL(d.name, ( s.database_name )) NOT IN ( 'tempdb',
+                                                         'distribution' )
+GROUP BY ISNULL(d.name, ( s.database_name + ' (Legacy)' )) ,
+        d.state_desc, d.recovery_model_desc, d.source_database_Id, create_date--, s.encryptor_type, s.key_algorithm,s.encryptor_thumbprint  --, dev.logical_device_name, dev.physical_device_name
+Order By 2
+
+--  select * from  #BU_FullStart order by 1, 2
+
+Select	d.*, 	
+		s.encryptor_type,
+		s.key_algorithm,
+		s.encryptor_thumbprint, 
+		c.name					As CertificateName,
+		Case 
+			When c.pvt_key_last_backup_date is not null Then 'Current'
+			When c.name is not null						Then 'No Backup!' 
+			Else NULL
+		End				As CertBackedUp
+INTO #BU_ListingFull
+from #BU_FullStart d
+join msdb.dbo.backupset s
+	ON  d.DBName			 = s.database_name
+	and d.LastFullBackup = s.backup_start_date
+left Outer Join  sys.certificates c
+	On s.encryptor_thumbprint = c.thumbprint 
+
+
+
+
+-- Get the last DIFF backup from the backupset for all databases including dropped (legacy) ones
+--SELECT database_name FROM msdb.dbo.backupset s 
+--SELECT * FROM sys.databases
+
+select		isnull(d.name, (s.database_name + ' (Legacy)')) as 'DBNameDiff',
+			max(s.backup_start_date)                        AS 'LastDiffBackup',
+			case  
+				when max(s.backup_start_date) > dateadd(day, @DBCurrent, getdate())  --> backups older than 24 hours
+					then 'Current'
+				when max(s.backup_start_date) is Null 
+					then 'No Diff'
+					else NULL
+			end as 'DiffStatus'
+	into #BU_ListingDiff
+	From msdb.dbo.backupset s 
+	full outer join master.dbo.sysdatabases d	
+		on d.name = s.database_name 
+	where ( s.type = 'I' ) 
+	  and isnull(d.name, (s.database_name)) not in ('tempdb', 'distribution')
+	group by isnull(d.name, (s.database_name + ' (Legacy)')) --, dev.logical_device_name, dev.physical_device_name
+	order by 2
+
+
+-- Get the last Log backup from the backupset for all databases including dropped (legacy) ones
+
+select		isnull(d.name, (s.database_name + ' (Legacy)')) as 'DBNameLog',
+			max(s.backup_start_date)                        AS 'LastLogBackup',
+			'Unknown'										AS 'LogStatus'
+	into #BU_ListingLog
+	From msdb.dbo.backupset s 
+	full outer join master.dbo.sysdatabases d	
+		on d.name = s.database_name 
+	where ( s.type = 'L' ) 
+	  and isnull(d.name, (s.database_name)) not in ('tempdb', 'distribution')
+	group by isnull(d.name, (s.database_name + ' (Legacy)')) --, dev.logical_device_name, dev.physical_device_name
+	order by 2
+
+
+
+--decide TO Display legacy DATABASE backups IN list
+
+IF @LegacyDB = 'No'
+	SET @LegacyDB = 'Legacy'
+
+Select	ServerProperty('ServerName')					As [SQLServerName],  
+		ServerProperty('ComputerNamePhysicalNetBIOS')	As [ComputerName], 
+		Fbk.DBName										As 'DatabaseName', 
+		Case 
+			When DBSnapshot = 'Yes'
+				Then 'Snapshot'
+			When Fbk.Status = 'Failed' 
+			    Then Case 
+					     When FBk.DBName Like '%Legacy%'	Then 'N/A'
+						 When Diff.DiffStatus = 'Current'  	Then 'Warning'
+						 Else 'Failed'
+					 End
+			When Fbk.Status = 'Warning' 
+			    Then Case 
+					     When FBk.DBName Like '%Legacy%'	Then 'N/A'
+						 When LastDiffBackup Is Null        Then 'Warning'
+						 When LastDiffBackup > DateAdd( Day, @DBFailure, GetDate())  	Then 'Check Diff'
+						 Else 'Failed'
+					 End 
+
+			     Else Fbk.Status
+			End                                             As 'BkupStatus',
+			Case
+				When DBSnapshot = 'Yes'
+					Then 'N/A'
+ 				When Diff.LastDiffBackup > Fbk.lastFullBackup 
+				     Then Diff.DiffStatus 
+                When Diff.LastDiffBackup < Fbk.lastFullBackup 
+				     Then 'N/A'
+					Else 'No Diff'
+			End												As 'DiffStatus',
+			Case  
+				When DBSnapshot = 'Yes'
+					Then 'N/A'
+                When s.recovery_model = 'SIMPLE'
+					Then 'N/A'
+				When LogBk.LastLogBackup > DateAdd( Hour, -2, GetDate()) 
+					Then 'Current'
+				When logBk.LastLogBackup Is Null 
+					Then 'No Log!'
+				When LogBk.LastLogBackup < Fbk.LastFullBackup 
+					Then 'No Log!'
+					Else LogBk.LogStatus 	End				As 'LogStatus',
+		Case 
+			When DBSnapshot = 'Yes' 
+				Then FBK.create_date
+				Else Fbk.LastFullBackup     End				As 'LastFullBackup/Snapshot',
+		s.backup_size										As 'BackupSize',
+		FBK.DBState                                         As 'DBState',
+		Case s.is_copy_only  
+		When 1
+		    Then 'Yes'
+		    Else 'No '      End                             As 'CopyOnly',
+		FBk.recovery_model_desc								As 'RecoveryModel',
+		Convert(Varchar(4), software_major_version ) + '.' +
+		Convert(Varchar(4), software_minor_version) + '.' +	
+		Convert(Varchar(10),software_build_version) + '.' +
+		Convert(Varchar(4), mtf_minor_version)              As 'SoftwareVersion',
+		diff.LastDiffBackup									As 'LastDiffBackup',
+		LogBk.LastLogBackup									As 'LastLogBackup',
+		dev.physical_device_name							As 'BackupLocation' ,
+		IsNull( dev.logical_device_name,' ' )				As 'BackupDeviceUsed' ,
+		bd.name												As 'BackupDeviceName',
+		bd.phyname											As 'BackupDeviceLocation',
+        FBk.CertificateName, 
+		FBk.encryptor_type,
+		FBK.key_algorithm,
+		FBK.CertBackedUp, 
+		'Backup Database [' + Fbk.DBName + '] to disk = ''' 
+		+ dbo.fn_SQLServerBackupDir() + '\' 
+		+ Replace(Fbk.DBName, '.', '.' ) + '_'
+		+ Right('0' + Cast( Year(GetDate()) As NVarchar(4)), 4) + '_'
+		+ Right('0' + Cast(Month(GetDate()) As NVarchar(2)), 2) + '_'
+		+ Right('0' + Cast(  Day(GetDate()) As NVarchar(2)), 2) + '_'
+		+ Replace( Convert(Time(0),GetDate()), ':', ''   )
+		+ '_0000000.bak'' with compression '
+		+ Case
+			When fbk.encryptor_type = 'CERTIFICATE' 
+				Then ', ENCRYPTION ( ALGORITHM = ' + s.key_algorithm + ', SERVER CERTIFICATE = ' + FBk.CertificateName  + ' )'
+			Else  '--  No previous Encryption' 
+		  End 
+		+ '--, differential'                   As 'Backup Command',
+		'sp_GenerateRestore ' + Fbk.DBName     As 'Restore Command'
+--INTO BU_Listing    
+From #BU_ListingFull FBk
+Left Outer Join 	msdb.dbo.backupset s
+	On  Replace(Fbk.DBName,' (Legacy)', '')	= s.database_name
+	And	FBk.LastFullBackup = s.backup_start_date
+Left Outer Join msdb.dbo.backupmediafamily dev
+	On s.media_set_id = dev.media_set_id
+Left Outer Join master.dbo.sysdevices bd
+	On 'bu_' + Fbk.DBName = bd.name
+Left Outer Join 	#BU_ListingLog LogBk
+	On  Fbk.DBName = LogBk.DBNameLog
+Left Outer Join 	#BU_ListingDiff Diff
+	On  Fbk.DBName = Diff.DBNameDiff
+Where Fbk.DBName Not Like '%(' + @LegacyDB + ')%'
+Order By Fbk.DBName
+
+--  sp_backupInfo  -- Eric Peterson
+GO
+
+
